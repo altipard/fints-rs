@@ -102,12 +102,21 @@ pub(crate) fn hnhbs(segment_number: u16, message_number: u16) -> Vec<DEG> {
 
 // ---- HNVSK (Verschlüsselungskopf) - Encryption Header, version 3 ----
 
+/// Security profile DEG "PIN:<version>". Version 1 is the one-step procedure
+/// (security function 999), every two-step procedure (9xx) needs version 2.
+/// HNVSK and HNSHK of one message must carry the same profile.
+fn pin_profile(security_function: &str) -> DEG {
+    let version = if security_function == "999" { "1" } else { "2" };
+    deg(vec![de_text("PIN"), de_text(version)])
+}
+
 /// Build HNVSK:998:3 with PinTan dummy encryption parameters.
-pub(crate) fn hnvsk(blz: &str, user_id: &str, system_id: &str) -> Vec<DEG> {
+/// `security_function` is the one used for the HNSHK of the same message.
+pub(crate) fn hnvsk(blz: &str, user_id: &str, system_id: &str, security_function: &str) -> Vec<DEG> {
     vec![
         seg_header("HNVSK", 998, 3),
-        // Security profile: PIN:1
-        deg(vec![de_text("PIN"), de_text("1")]),
+        // Security profile: PIN:1 (one-step) or PIN:2 (two-step)
+        pin_profile(security_function),
         // Security function: 998 (encryption)
         deg1(de_text("998")),
         // Security role: 1 = ISS (issuer)
@@ -170,8 +179,8 @@ pub(crate) fn hnshk(
 ) -> Vec<DEG> {
     vec![
         seg_header("HNSHK", segment_number, 4),
-        // Security profile: PIN:1
-        deg(vec![de_text("PIN"), de_text("1")]),
+        // Security profile: PIN:1 (one-step) or PIN:2 (two-step)
+        pin_profile(security_function),
         // Security function (e.g. "999" for one-step, "912" for pushTAN)
         deg1(de_text(security_function)),
         // Security reference (random number linking HNSHK <-> HNSHA)
@@ -718,5 +727,17 @@ mod tests {
             wire(&hktan_process2(7, 6, "REF123", Some("iPhone"))),
             "HKTAN:7:6+2++++REF123+N+++++iPhone'"
         );
+    }
+
+    #[test]
+    fn hnvsk_hnshk_profile_is_pin1_for_one_step() {
+        assert!(wire(&hnvsk("12030000", "user", "sys", "999")).starts_with("HNVSK:998:3+PIN:1+998+"));
+        assert!(wire(&hnshk(2, "999", 4711, "12030000", "user", "sys")).starts_with("HNSHK:2:4+PIN:1+999+4711+"));
+    }
+
+    #[test]
+    fn hnvsk_hnshk_profile_is_pin2_for_two_step() {
+        assert!(wire(&hnvsk("70020270", "user", "sys", "904")).starts_with("HNVSK:998:3+PIN:2+998+"));
+        assert!(wire(&hnshk(2, "904", 4711, "70020270", "user", "sys")).starts_with("HNSHK:2:4+PIN:2+904+4711+"));
     }
 }
