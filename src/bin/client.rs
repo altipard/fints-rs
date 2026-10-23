@@ -590,6 +590,19 @@ fn prompt_tan(cli_tan: Option<&str>, challenge: Option<&str>) -> Result<String, 
     rpassword::prompt_password("TAN: ").map_err(|e| format!("Failed to read TAN: {}", e))
 }
 
+/// TAN provider for the library: prints the bank's challenge text, then asks
+/// for the TAN. `--tan` serves only the first TAN, every further order needs its own.
+fn make_tan_provider(
+    cli_tan: Option<String>,
+) -> impl FnMut(&fints::protocol::TanChallenge) -> fints::error::Result<String> {
+    let mut cli_tan = cli_tan;
+    move |challenge| {
+        let text = challenge.challenge.as_str();
+        let text = if text.is_empty() { None } else { Some(text) };
+        prompt_tan(cli_tan.take().as_deref(), text).map_err(FinTSError::Dialog)
+    }
+}
+
 fn prompt_input(prompt_text: &str) -> Result<String, String> {
     print!("{}", prompt_text);
     io::stdout().flush().ok();
@@ -1059,7 +1072,7 @@ async fn cmd_setup(cli: &Cli) -> Result<(), String> {
 
     println!("\nConnecting to {} ({})...", bank.name, bank.url);
 
-    let (flow, challenge) = Flow::initiate_with_bank(
+    let (mut flow, challenge) = Flow::initiate_with_bank(
         bank.to_bank_ops(),
         &user_id,
         &pin,
@@ -1070,6 +1083,15 @@ async fn cmd_setup(cli: &Cli) -> Result<(), String> {
     )
     .await
     .map_err(|e| map_fints_error(&e))?;
+
+    // Banks that demand a TAN at dialog start: answer it now (decoupled ones are polled in sync).
+    if !challenge.no_tan_required && !challenge.decoupled {
+        let mut provider = make_tan_provider(cli.tan.clone());
+        flow.confirm_tan_with(&mut provider)
+            .await
+            .map_err(|e| map_fints_error(&e))?;
+        flow.end().await.ok();
+    }
 
     let system_id = flow.system_id().clone();
 
@@ -1225,8 +1247,9 @@ async fn cmd_sync(cli: &Cli, sync_args: &SyncArgs) -> Result<(), String> {
         .cloned()
         .ok_or("No account to sync")?;
 
+    let mut tan_provider = make_tan_provider(cli.tan.clone());
     let result = flow
-        .confirm_and_fetch_opts(&first_iban, &first_bic, &fetch_opts)
+        .confirm_and_fetch_opts_with_tan(&first_iban, &first_bic, &fetch_opts, &mut tan_provider)
         .await
         .map_err(|e| map_fints_error(&e))?;
 
@@ -1342,8 +1365,9 @@ async fn cmd_balance(cli: &Cli, balance_args: &BalanceArgs) -> Result<(), String
     };
 
     // Fetch only 1 day to get balance quickly
+    let mut tan_provider = make_tan_provider(cli.tan.clone());
     let result = flow
-        .confirm_and_fetch(&iban, &bic, 1)
+        .confirm_and_fetch_opts_with_tan(&iban, &bic, &FetchOpts::all(1), &mut tan_provider)
         .await
         .map_err(|e| map_fints_error(&e))?;
 
@@ -1450,8 +1474,9 @@ async fn cmd_transactions(cli: &Cli, args: &TransactionsArgs) -> Result<(), Stri
     .await
     .map_err(|e| map_fints_error(&e))?;
 
+    let mut tan_provider = make_tan_provider(cli.tan.clone());
     let result = flow
-        .confirm_and_fetch(&iban, &bic, days)
+        .confirm_and_fetch_opts_with_tan(&iban, &bic, &FetchOpts::all(days), &mut tan_provider)
         .await
         .map_err(|e| map_fints_error(&e))?;
 

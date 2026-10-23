@@ -48,7 +48,7 @@ pub struct SyncResult {
 enum FlowState {
     WaitingForTan {
         dialog: Dialog<TanPending>,
-        task_reference: TaskReference,
+        challenge: TanChallenge,
     },
     Authenticated {
         dialog: Dialog<Open>,
@@ -118,7 +118,7 @@ impl Flow {
                     bank,
                     state: FlowState::WaitingForTan {
                         dialog: result.dialog,
-                        task_reference: result.challenge.task_reference,
+                        challenge: result.challenge,
                     },
                     system_id: result.system_id,
                 };
@@ -156,56 +156,85 @@ impl Flow {
 
     /// Step 2 with fine-grained fetch control.
     /// Use `FetchOpts` to choose which data to retrieve in a single dialog.
+    /// Fails for non-decoupled TANs, use `confirm_and_fetch_opts_with_tan` for those.
     pub async fn confirm_and_fetch_opts(
         &mut self,
         iban: &str,
         bic: &str,
         opts: &FetchOpts,
     ) -> Result<SyncResult> {
-        let state = std::mem::replace(&mut self.state, FlowState::Done);
+        let mut no_provider = |_: &TanChallenge| -> Result<String> {
+            Err(FinTSError::Dialog("a TAN is required but no TAN provider was given".into()))
+        };
+        self.confirm_and_fetch_opts_with_tan(iban, bic, opts, &mut no_provider).await
+    }
 
-        match state {
-            FlowState::WaitingForTan { dialog, task_reference } => {
-                let poll_result = dialog.poll(&task_reference).await?;
+    /// Like `confirm_and_fetch_opts`; TANs (init and per order) of non-decoupled
+    /// methods are requested from `provider` and submitted with HKTAN process 2.
+    pub async fn confirm_and_fetch_opts_with_tan(
+        &mut self,
+        iban: &str,
+        bic: &str,
+        opts: &FetchOpts,
+        provider: &mut TanProvider,
+    ) -> Result<SyncResult> {
+        let mut open = self.authenticate(provider).await?;
+        let account = self.resolve_account(iban, bic)?;
+        let fetch = self.bank.fetch_with_opts_tan(&mut open, &account, opts, provider).await?;
+        let sys_id = open.system_id().clone();
+        open.end().await.ok();
+        Ok(SyncResult {
+            iban: Iban::new(iban), bic: Bic::new(bic),
+            balance: fetch.balance, transactions: fetch.transactions,
+            holdings: fetch.holdings,
+            system_id: Some(sys_id),
+        })
+    }
 
-                match poll_result {
-                    PollResult::Confirmed(mut open, _response) => {
-                        info!("[Flow] TAN confirmed — fetching data");
-                        let account = self.resolve_account(iban, bic)?;
-                        let fetch = self.bank.fetch_with_opts(&mut open, &account, opts).await?;
-                        let sys_id = open.system_id().clone();
-                        open.end().await.ok();
-                        Ok(SyncResult {
-                            iban: Iban::new(iban), bic: Bic::new(bic),
-                            balance: fetch.balance, transactions: fetch.transactions,
-                            holdings: fetch.holdings,
-                            system_id: Some(sys_id),
-                        })
+    /// Complete the init TAN (if any) and keep the dialog open for later use.
+    pub async fn confirm_tan_with(&mut self, provider: &mut TanProvider) -> Result<()> {
+        let open = self.authenticate(provider).await?;
+        self.state = FlowState::Authenticated { dialog: open };
+        Ok(())
+    }
+
+    /// End the dialog of an authenticated flow.
+    pub async fn end(&mut self) -> Result<()> {
+        match std::mem::replace(&mut self.state, FlowState::Done) {
+            FlowState::Authenticated { dialog } => dialog.end().await,
+            other => { self.state = other; Ok(()) }
+        }
+    }
+
+    /// Turn the current state into an open dialog: poll decoupled TANs,
+    /// submit others via `provider` (HKTAN process 2).
+    async fn authenticate(&mut self, provider: &mut TanProvider) -> Result<Dialog<Open>> {
+        match std::mem::replace(&mut self.state, FlowState::Done) {
+            FlowState::WaitingForTan { dialog, challenge } if challenge.decoupled => {
+                match dialog.poll(&challenge.task_reference).await? {
+                    PollResult::Confirmed(open, _response) => {
+                        info!("[Flow] TAN confirmed");
+                        Ok(open)
                     }
                     PollResult::Pending(dialog) => {
-                        self.state = FlowState::WaitingForTan { dialog, task_reference };
+                        self.state = FlowState::WaitingForTan { dialog, challenge };
                         Err(FinTSError::Dialog(
                             "TAN still pending: user has not yet confirmed in banking app".into()
                         ))
                     }
                 }
             }
-            FlowState::Authenticated { mut dialog } => {
-                info!("[Flow] Already authenticated — fetching directly");
-                let account = self.resolve_account(iban, bic)?;
-                let fetch = self.bank.fetch_with_opts(&mut dialog, &account, opts).await?;
-                let sys_id = dialog.system_id().clone();
-                dialog.end().await.ok();
-                Ok(SyncResult {
-                    iban: Iban::new(iban), bic: Bic::new(bic),
-                    balance: fetch.balance, transactions: fetch.transactions,
-                    holdings: fetch.holdings,
-                    system_id: Some(sys_id),
-                })
+            FlowState::WaitingForTan { dialog, challenge } => {
+                let tan = provider(&challenge)?;
+                let (open, _response) = dialog.submit_tan(&challenge.task_reference, &tan).await?;
+                info!("[Flow] TAN submitted");
+                Ok(open)
             }
-            FlowState::Done => {
-                Err(FinTSError::Dialog("Flow already completed".into()))
+            FlowState::Authenticated { dialog } => {
+                info!("[Flow] Already authenticated");
+                Ok(dialog)
             }
+            FlowState::Done => Err(FinTSError::Dialog("Flow already completed".into())),
         }
     }
 
@@ -218,7 +247,8 @@ impl Flow {
         let state = std::mem::replace(&mut self.state, FlowState::Done);
 
         match state {
-            FlowState::WaitingForTan { dialog, task_reference } => {
+            FlowState::WaitingForTan { dialog, challenge } => {
+                let task_reference = challenge.task_reference.clone();
                 let poll_result = dialog.poll(&task_reference).await?;
 
                 match poll_result {
@@ -230,7 +260,7 @@ impl Flow {
                         Ok(holdings)
                     }
                     PollResult::Pending(dialog) => {
-                        self.state = FlowState::WaitingForTan { dialog, task_reference };
+                        self.state = FlowState::WaitingForTan { dialog, challenge };
                         Err(FinTSError::Dialog(
                             "TAN still pending: user has not yet confirmed in banking app".into()
                         ))
