@@ -317,22 +317,20 @@ pub(crate) fn hktan_process4(
     ];
 
     if version >= 6 {
-        // For v6+: empty fields until tan_medium_name
-        // account, order_hash_value, order_reference, further_tan_follows, cancel_order
-        degs.push(deg1(de_empty())); // account (not used)
-        degs.push(deg1(de_empty())); // order_hash_value
-        degs.push(deg1(de_empty())); // order_reference
-        degs.push(deg1(de_empty())); // further_tan_follows (must not be populated for process 4)
-        degs.push(deg1(de_empty())); // cancel_order
-    }
-
-    if let Some(name) = tan_medium_name {
-        // For v6+: skip some fields to reach tan_medium_name
-        if version >= 6 {
-            degs.push(deg1(de_empty())); // sms_charge_account
-            degs.push(deg1(de_empty())); // challenge_class
-            degs.push(deg1(de_empty())); // challenge_class_params
+        // account, order_hash_value, order_reference, further_tan_follows,
+        // cancel_order, sms_charge_account, challenge_class,
+        // challenge_class_params, tan_medium_name. Trailing empty DEs are
+        // omitted, banks reject superfluous ones.
+        let mut tail: Vec<Option<&str>> = vec![None; 8];
+        tail.push(tan_medium_name);
+        while matches!(tail.last(), Some(None)) {
+            tail.pop();
         }
+        degs.extend(tail.into_iter().map(|f| match f {
+            Some(v) => deg1(de_text(v)),
+            None => deg1(de_empty()),
+        }));
+    } else if let Some(name) = tan_medium_name {
         degs.push(deg1(de_text(name)));
     }
 
@@ -688,5 +686,22 @@ mod tests {
     #[should_panic(expected = "BIC must not be empty")]
     fn kti_panics_on_empty_bic() {
         Kti::new("DE04120300001084174299", "");
+    }
+
+    fn wire(degs: &[crate::parser::DEG]) -> String {
+        String::from_utf8(serialize_segment(degs).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn hktan_process4_v6_omits_trailing_empty_des() {
+        assert_eq!(wire(&hktan_process4(5, 6, "HKIDN", None)), "HKTAN:5:6+4+HKIDN'");
+    }
+
+    #[test]
+    fn hktan_process4_v6_pads_up_to_tan_medium() {
+        assert_eq!(
+            wire(&hktan_process4(5, 6, "HKIDN", Some("iPhone"))),
+            "HKTAN:5:6+4+HKIDN+++++++++iPhone'"
+        );
     }
 }
