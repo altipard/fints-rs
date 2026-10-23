@@ -264,6 +264,41 @@ impl Response {
         None
     }
 
+    /// Did the bank reject only the HKTAN of a dialog init (e.g. 9210 on the
+    /// HKTAN segment) while accepting HKIDN? Some banks want SCA per order,
+    /// not at dialog start, and answer such an init with 9050 + 9210.
+    ///
+    /// `hkidn_ref`/`hktan_ref` are the segment numbers of the request segments
+    /// the HIRMS segments refer to. Any other error (also on HKIDN/HKVVB, PIN
+    /// or lock codes, global errors besides 9050) makes this `false`.
+    pub fn hktan_rejected_at_init(&self, hkidn_ref: u16, hktan_ref: u16) -> bool {
+        let mut hktan_error = false;
+        let mut hkidn_accepted = false;
+        for seg in self.segments.iter().filter(|s| s.segment_type() == "HIRMS") {
+            let reference = seg.segment_reference();
+            for code in ResponseCode::parse_from_segment(seg) {
+                if code.is_error() {
+                    let fatal = matches!(
+                        code.kind,
+                        ResponseCodeKind::PinWrong | ResponseCodeKind::AccountLocked
+                    );
+                    if reference == Some(hktan_ref) && !fatal {
+                        hktan_error = true;
+                    } else {
+                        return false;
+                    }
+                } else if reference == Some(hkidn_ref)
+                    && matches!(code.kind, ResponseCodeKind::MessageReceived | ResponseCodeKind::OrderExecuted)
+                {
+                    hkidn_accepted = true;
+                }
+            }
+        }
+        let global_ok = self.global_codes.iter()
+            .all(|c| !c.is_error() || matches!(c.kind, ResponseCodeKind::PartialErrors));
+        hktan_error && hkidn_accepted && global_ok
+    }
+
     /// Check for fatal errors. Returns `Ok(())` if no errors.
     pub fn check_errors(&self) -> Result<()> {
         for code in self.all_codes() {
@@ -590,6 +625,11 @@ impl<S: std::fmt::Debug> Dialog<S> {
 
 // ── Dialog<New> ─────────────────────────────────────────────────────────────
 
+/// Segment numbers of HKIDN and HKTAN in the init message: HNHBK is 1, HNSHK 2,
+/// the business segments (HKIDN, HKVVB, HKTAN) follow in order (see message.rs).
+const INIT_HKIDN_REF: u16 = 3;
+const INIT_HKTAN_REF: u16 = 5;
+
 impl Dialog<New> {
     pub fn new(url: &str, blz: &Blz, user_id: &UserId, pin: &Pin, product_id: &ProductId) -> Result<Self> {
         Ok(Self {
@@ -676,6 +716,15 @@ impl Dialog<New> {
 
         for c in response.all_codes() {
             info!("[FinTS] Init: {} - {}", c.code(), c.text);
+        }
+
+        if response.hktan_rejected_at_init(INIT_HKIDN_REF, INIT_HKTAN_REF) {
+            info!("[FinTS] Init: bank rejects HKTAN at dialog start, reopening without SCA");
+            // Errors on HKEND are irrelevant, the dialog is abandoned anyway.
+            self.send_end().await.ok();
+            self.message_number = 1;
+            let (open, response) = self.init_no_tan().await?;
+            return Ok(InitResult::Opened(open, response));
         }
 
         // Response-driven transition per spec:
@@ -1099,4 +1148,56 @@ fn parse_response(data: &[u8], expected_msg_num: u16) -> Result<Response> {
     }
 
     Ok(Response { segments: all_segments, global_codes, segment_codes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(raw: &str) -> Response {
+        parse_response(raw.as_bytes(), 1).unwrap()
+    }
+
+    #[test]
+    fn init_with_only_hktan_rejected_is_detected() {
+        let r = response(
+            "HIRMG:2:2+9050::Teilweise fehlerhaft'\
+             HIRMS:3:2:3+0020::Information fehlerfrei entgegengenommen'\
+             HIRMS:4:2:4+1040::BPD nicht mehr aktuell+3920::Verfahren:904'\
+             HIRMS:5:2:5+9210::Auftrag abgelehnt. Kein eingereichter Auftrag gefunden'",
+        );
+        assert!(r.hktan_rejected_at_init(INIT_HKIDN_REF, INIT_HKTAN_REF));
+    }
+
+    #[test]
+    fn init_with_error_on_hkidn_stays_an_error() {
+        for code in ["9075::Dialogabbruch", "9210::Auftrag abgelehnt", "9340::PIN falsch"] {
+            let r = response(&format!(
+                "HIRMG:2:2+9050::Teilweise fehlerhaft'\
+                 HIRMS:3:2:3+{code}'\
+                 HIRMS:5:2:5+9210::Auftrag abgelehnt'"
+            ));
+            assert!(!r.hktan_rejected_at_init(INIT_HKIDN_REF, INIT_HKTAN_REF), "{code}");
+        }
+    }
+
+    #[test]
+    fn init_without_hktan_error_or_with_other_global_error_is_not_a_fallback() {
+        let ok = response(
+            "HIRMG:2:2+0010::ok'HIRMS:3:2:3+0020::ok'HIRMS:5:2:5+0020::ok'",
+        );
+        assert!(!ok.hktan_rejected_at_init(INIT_HKIDN_REF, INIT_HKTAN_REF));
+        let global = response(
+            "HIRMG:2:2+9010::Fehler'HIRMS:3:2:3+0020::ok'HIRMS:5:2:5+9210::abgelehnt'",
+        );
+        assert!(!global.hktan_rejected_at_init(INIT_HKIDN_REF, INIT_HKTAN_REF));
+    }
+
+    #[test]
+    fn init_with_pin_wrong_on_hktan_is_not_a_fallback() {
+        let r = response(
+            "HIRMG:2:2+9050::x'HIRMS:3:2:3+0020::ok'HIRMS:5:2:5+9340::PIN falsch'",
+        );
+        assert!(!r.hktan_rejected_at_init(INIT_HKIDN_REF, INIT_HKTAN_REF));
+    }
 }
