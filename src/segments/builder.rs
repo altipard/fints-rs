@@ -356,7 +356,10 @@ pub(crate) fn hktan_process2(
         degs.push(deg1(de_empty())); // order_hash_value
         degs.push(deg1(de_text(task_reference))); // task reference (from HITAN)
         degs.push(deg1(de_bool(false))); // further_tan_follows = N
-        degs.push(deg1(de_empty())); // cancel_order
+        // cancel_order only as filler in front of the medium name, trailing empty DEs are rejected
+        if tan_medium_name.is_some() {
+            degs.push(deg1(de_empty())); // cancel_order
+        }
     } else {
         degs.push(deg1(de_empty())); // segment_type
         degs.push(deg1(de_empty())); // account
@@ -702,6 +705,18 @@ mod tests {
         assert_eq!(
             wire(&hktan_process4(5, 6, "HKIDN", Some("iPhone"))),
             "HKTAN:5:6+4+HKIDN+++++++++iPhone'"
+        );
+    }
+
+    #[test]
+    fn hktan_process2_v6_carries_reference_without_trailing_empty_des() {
+        assert_eq!(
+            wire(&hktan_process2(7, 6, "REF123", None)),
+            "HKTAN:7:6+2++++REF123+N'"
+        );
+        assert_eq!(
+            wire(&hktan_process2(7, 6, "REF123", Some("iPhone"))),
+            "HKTAN:7:6+2++++REF123+N+++++iPhone'"
         );
     }
 }

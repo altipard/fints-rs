@@ -153,6 +153,10 @@ impl Segment {
     }
 }
 
+/// Supplies the TAN for a challenge (e.g. by prompting the user). Called once
+/// per TAN-requiring order; the bank's challenge text is part of the argument.
+pub type TanProvider = dyn FnMut(&TanChallenge) -> Result<String>;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Result of dialog init — response-driven transition
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -904,17 +908,41 @@ impl Dialog<Open> {
             }
         }
 
-        // Check errors
-        response.check_errors()?;
+        Self::finish_balance(&response)
+    }
 
-        // Parse HISAL
+    fn finish_balance(response: &Response) -> Result<BalanceResult> {
+        response.check_errors()?;
         if let Some(hisal) = response.find_segment("HISAL") {
             if let Some(balance) = parse_hisal(hisal) {
                 return Ok(BalanceResult::Success(balance));
             }
         }
-
         Ok(BalanceResult::Empty)
+    }
+
+    /// Like `balance`, but answers a (non-decoupled) TAN challenge via `provider`
+    /// with HKTAN process 2 and returns the data from the bank's final response.
+    pub async fn balance_with_tan(&mut self, account: &Account, provider: &mut TanProvider) -> Result<BalanceResult> {
+        match self.balance(account).await? {
+            BalanceResult::NeedTan(ch) if !ch.decoupled => {
+                let response = self.submit_order_tan(&ch, provider).await?;
+                Self::finish_balance(&response)
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Answer the TAN challenge of an order in this dialog: asks `provider`
+    /// for the TAN and sends HKTAN process 2 (task reference from HITAN, TAN in HNSHA).
+    /// The response carries the business data of the order.
+    pub async fn submit_order_tan(&mut self, challenge: &TanChallenge, provider: &mut TanProvider) -> Result<Response> {
+        let tan = provider(challenge)?;
+        let segments = [Segment::TanProcess2 {
+            task_reference: challenge.task_reference.clone(),
+            tan_medium: self.params.selected_tan_medium.clone(),
+        }];
+        self.send_segments_with_tan(&segments, &tan).await
     }
 
     /// Request account transactions (HKKAZ) — single page.
@@ -967,10 +995,11 @@ impl Dialog<Open> {
             }
         }
 
-        // Check errors
-        response.check_errors()?;
+        Self::finish_transactions(&response)
+    }
 
-        // Extract MT940 data
+    fn finish_transactions(response: &Response) -> Result<TransactionResult> {
+        response.check_errors()?;
         let mt940 = extract_mt940_data(&response.segments);
         let td = response.touchdown();
 
@@ -979,6 +1008,24 @@ impl Dialog<Open> {
             pending: Mt940Data(mt940.pending),
             touchdown: td,
         }))
+    }
+
+    /// Like `transactions`, but answers a (non-decoupled) TAN challenge via `provider`.
+    pub async fn transactions_with_tan(
+        &mut self,
+        account: &Account,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        touchdown: Option<&TouchdownPoint>,
+        provider: &mut TanProvider,
+    ) -> Result<TransactionResult> {
+        match self.transactions(account, start_date, end_date, touchdown).await? {
+            TransactionResult::NeedTan(ch) if !ch.decoupled => {
+                let response = self.submit_order_tan(&ch, provider).await?;
+                Self::finish_transactions(&response)
+            }
+            other => Ok(other),
+        }
     }
 
     /// Request securities holdings (HKWPD).
@@ -1030,10 +1077,11 @@ impl Dialog<Open> {
             }
         }
 
-        // Check errors
-        response.check_errors()?;
+        Self::finish_holdings(&response)
+    }
 
-        // Parse HIWPD segments
+    fn finish_holdings(response: &Response) -> Result<HoldingsResult> {
+        response.check_errors()?;
         let holdings = parse_hiwpd(&response.segments);
         let td = response.touchdown();
 
@@ -1045,6 +1093,23 @@ impl Dialog<Open> {
             holdings,
             touchdown: td,
         }))
+    }
+
+    /// Like `holdings`, but answers a (non-decoupled) TAN challenge via `provider`.
+    pub async fn holdings_with_tan(
+        &mut self,
+        account: &Account,
+        currency: Option<&Currency>,
+        touchdown: Option<&TouchdownPoint>,
+        provider: &mut TanProvider,
+    ) -> Result<HoldingsResult> {
+        match self.holdings(account, currency, touchdown).await? {
+            HoldingsResult::NeedTan(ch) if !ch.decoupled => {
+                let response = self.submit_order_tan(&ch, provider).await?;
+                Self::finish_holdings(&response)
+            }
+            other => Ok(other),
+        }
     }
 
     /// End the dialog.
@@ -1199,5 +1264,18 @@ mod tests {
             "HIRMG:2:2+9050::x'HIRMS:3:2:3+0020::ok'HIRMS:5:2:5+9340::PIN falsch'",
         );
         assert!(!r.hktan_rejected_at_init(INIT_HKIDN_REF, INIT_HKTAN_REF));
+    }
+
+    #[test]
+    fn order_challenge_with_reference_and_text_is_extracted() {
+        let r = response(
+            "HIRMS:4:2:3+0030::Auftrag empfangen - Sicherheitsfreigabe erforderlich'\
+             HITAN:5:6:3+4++REF-4711+Freigabe durch appTAN'",
+        );
+        assert!(r.needs_tan());
+        let ch = r.get_tan_challenge().expect("challenge");
+        assert_eq!(ch.task_reference.as_str(), "REF-4711");
+        assert_eq!(ch.challenge.as_str(), "Freigabe durch appTAN");
+        assert!(!ch.decoupled);
     }
 }

@@ -497,11 +497,27 @@ impl AnyBank {
 
     /// Fetch data with fine-grained control via `FetchOpts`.
     /// This gives callers a single authenticated dialog for all operations.
+    /// Orders that need a TAN fail, use `fetch_with_opts_tan` to answer them.
     pub async fn fetch_with_opts(
         &self,
         dialog: &mut Dialog<Open>,
         account: &Account,
         opts: &FetchOpts,
+    ) -> Result<FetchResult> {
+        let mut no_provider = |_: &TanChallenge| -> Result<String> {
+            Err(FinTSError::Dialog("order requires a TAN but no TAN provider was given".into()))
+        };
+        self.fetch_with_opts_tan(dialog, account, opts, &mut no_provider).await
+    }
+
+    /// Like `fetch_with_opts`; every TAN-requiring order (HKSAL, HKKAZ, HKWPD per
+    /// HIPINS) asks `provider` for its own TAN and is submitted with HKTAN process 2.
+    pub async fn fetch_with_opts_tan(
+        &self,
+        dialog: &mut Dialog<Open>,
+        account: &Account,
+        opts: &FetchOpts,
+        provider: &mut TanProvider,
     ) -> Result<FetchResult> {
         use tracing::warn;
         use crate::protocol::{BalanceResult, TransactionResult, HoldingsResult};
@@ -509,9 +525,9 @@ impl AnyBank {
 
         // ── Balance ──
         let balance = if opts.balance {
-            match dialog.balance(account).await {
+            match dialog.balance_with_tan(account, provider).await {
                 Ok(BalanceResult::Success(b)) => Some(b),
-                Ok(BalanceResult::NeedTan(_)) => { warn!("Balance requires TAN — skipping"); None }
+                Ok(BalanceResult::NeedTan(_)) => { warn!("Balance requires a decoupled TAN — skipping"); None }
                 Ok(BalanceResult::Empty) => None,
                 Err(e) => { warn!("Balance failed: {}", e); None }
             }
@@ -527,7 +543,7 @@ impl AnyBank {
             let mut all_pending = Mt940Data::new();
             let mut td: Option<TouchdownPoint> = None;
             loop {
-                match dialog.transactions(account, start_date, end_date, td.as_ref()).await? {
+                match dialog.transactions_with_tan(account, start_date, end_date, td.as_ref(), provider).await? {
                     TransactionResult::NeedTan(_) => break,
                     TransactionResult::Success(page) => {
                         if !page.booked.is_empty() { all_booked.extend(page.booked.0); }
@@ -550,10 +566,21 @@ impl AnyBank {
 
         // ── Holdings ──
         let holdings = if opts.holdings {
-            match self.fetch_holdings(dialog, account).await {
-                Ok(h) => h,
-                Err(e) => { warn!("Holdings fetch failed: {}", e); Vec::new() }
+            let mut all = Vec::new();
+            let mut td: Option<TouchdownPoint> = None;
+            loop {
+                match dialog.holdings_with_tan(account, None, td.as_ref(), provider).await {
+                    Ok(HoldingsResult::Success(page)) => {
+                        all.extend(page.holdings);
+                        td = page.touchdown;
+                        if td.is_none() { break; }
+                    }
+                    Ok(HoldingsResult::Empty) => break,
+                    Ok(HoldingsResult::NeedTan(_)) => { warn!("Holdings require a decoupled TAN — skipping"); break; }
+                    Err(e) => { warn!("Holdings fetch failed: {}", e); break; }
+                }
             }
+            all
         } else {
             Vec::new()
         };
