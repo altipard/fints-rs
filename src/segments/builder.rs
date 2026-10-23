@@ -5,6 +5,7 @@
 
 use chrono::{Local, NaiveDate};
 
+use crate::error::{FinTSError, Result};
 use crate::parser::{DataElement, DEG};
 use crate::types::*;
 
@@ -32,19 +33,20 @@ struct Kti {
 
 impl Kti {
     /// Create a new KTI for the given IBAN and BIC.
-    ///
-    /// # Panics
-    /// Panics if `iban` or `bic` is empty — these are programming errors, not runtime conditions.
-    fn new(iban: &str, bic: &str) -> Self {
-        assert!(!iban.is_empty(), "IBAN must not be empty in KTI DEG");
-        assert!(
-            !bic.is_empty(),
-            "BIC must not be empty in KTI DEG — use the bank's BIC as fallback"
-        );
-        Self {
+    /// Fails if either is empty (use the bank's BIC as fallback).
+    fn new(iban: &str, bic: &str) -> Result<Self> {
+        if iban.is_empty() {
+            return Err(FinTSError::Dialog("IBAN must not be empty in KTI DEG".into()));
+        }
+        if bic.is_empty() {
+            return Err(FinTSError::Dialog(
+                "BIC must not be empty in KTI DEG — use the bank's BIC as fallback".into(),
+            ));
+        }
+        Ok(Self {
             iban: iban.to_string(),
             bic: bic.to_string(),
-        }
+        })
     }
 
     /// Serialize into a DEG: `IBAN:BIC`.
@@ -121,8 +123,8 @@ pub(crate) fn hnvsk(blz: &str, user_id: &str, system_id: &str, security_function
         deg1(de_text("998")),
         // Security role: 1 = ISS (issuer)
         deg1(de_text("1")),
-        // Security identification: role=2(MS), cid=empty, system_id
-        deg(vec![de_text("2"), de_empty(), de_text(system_id)]),
+        // Security identification: party=1 (MS, message sender), cid=empty, system_id
+        deg(vec![de_text("1"), de_empty(), de_text(system_id)]),
         // Security timestamp: type=1 (STS), date (YYYYMMDD), time (HHMMSS)
         {
             let now = Local::now();
@@ -189,10 +191,10 @@ pub(crate) fn hnshk(
         deg1(de_text("1")),
         // Security role: 1 = ISS
         deg1(de_text("1")),
-        // Security identification: role=2(MS), cid=empty, system_id
-        deg(vec![de_text("2"), de_empty(), de_text(system_id)]),
-        // Security reference number: 1
-        deg1(de_text("1")),
+        // Security identification: party=1 (MS, message sender), cid=empty, system_id
+        deg(vec![de_text("1"), de_empty(), de_text(system_id)]),
+        // Security reference number: 2 (as sent by clients the HVB accepts)
+        deg1(de_text("2")),
         // Security timestamp: type=1 (STS), date (YYYYMMDD), time (HHMMSS)
         {
             let now = Local::now();
@@ -445,36 +447,52 @@ pub(crate) fn hkspa(segment_number: u16, version: u16) -> Vec<DEG> {
     vec![seg_header("HKSPA", segment_number, version)]
 }
 
+// ---- Account reference for HKSAL/HKKAZ ----
+
+/// Account as addressed in HKSAL/HKKAZ. Versions up to 6 take the national
+/// account (KTV: number:sub-account:280:BLZ), version 7 the international one (KTI).
+pub(crate) struct AccountRef<'a> {
+    pub iban: &'a str,
+    pub bic: &'a str,
+    /// Account number, sub-account feature and BLZ of the account, from HIUPD.
+    pub national: Option<(&'a str, &'a str, &'a str)>,
+}
+
+impl AccountRef<'_> {
+    /// Account DEG for the given segment version.
+    fn to_deg(&self, version: u16) -> Result<DEG> {
+        if version >= 7 {
+            return Ok(Kti::new(self.iban, self.bic)?.to_deg());
+        }
+        match self.national {
+            Some((number, sub_account, blz)) if !number.is_empty() && !blz.is_empty() => Ok(deg(vec![
+                de_text(number),
+                if sub_account.is_empty() { de_empty() } else { de_text(sub_account) },
+                de_text("280"),
+                de_text(blz),
+            ])),
+            _ => Err(FinTSError::Dialog(format!(
+                "account number and BLZ of {} missing in HIUPD, needed for version {}",
+                self.iban, version
+            ))),
+        }
+    }
+}
+
 // ---- HKSAL (Saldenabfrage) - Balance Request, version 5-7 ----
 
-/// Build HKSAL for a specific SEPA account. Version 7 uses international account (IBAN/BIC).
+/// Build HKSAL. Version 7 uses the international account (IBAN/BIC), older ones the national one.
 pub(crate) fn hksal(
     segment_number: u16,
     version: u16,
-    iban: &str,
-    bic: &str,
+    account: &AccountRef<'_>,
     touchdown: Option<&str>,
-) -> Vec<DEG> {
-    let mut degs = if version >= 6 {
-        // Version 6+: international account (KTI)
-        vec![
-            seg_header("HKSAL", segment_number, version),
-            Kti::new(iban, bic).to_deg(),
-            deg1(de_text("N")),
-        ]
-    } else {
-        // Version 5: national account format (KTO)
-        vec![
-            seg_header("HKSAL", segment_number, version),
-            deg(vec![
-                de_text(iban),
-                de_empty(),
-                de_text("280"),
-                de_text(bic),
-            ]),
-            deg1(de_text("N")),
-        ]
-    };
+) -> Result<Vec<DEG>> {
+    let mut degs = vec![
+        seg_header("HKSAL", segment_number, version),
+        account.to_deg(version)?,
+        deg1(de_text("N")),
+    ];
 
     // Max entries (optional)
     degs.push(deg1(de_empty()));
@@ -484,7 +502,7 @@ pub(crate) fn hksal(
         degs.push(deg1(de_text(td)));
     }
 
-    degs
+    Ok(degs)
 }
 
 // ---- HKKAZ (Kontoumsätze anfordern) - Statement Request (MT940), version 5-7 ----
@@ -492,35 +510,18 @@ pub(crate) fn hksal(
 pub(crate) fn hkkaz(
     segment_number: u16,
     version: u16,
-    iban: &str,
-    bic: &str,
+    account: &AccountRef<'_>,
     start_date: NaiveDate,
     end_date: NaiveDate,
     touchdown: Option<&str>,
-) -> Vec<DEG> {
-    let mut degs = if version >= 6 {
-        vec![
-            seg_header("HKKAZ", segment_number, version),
-            Kti::new(iban, bic).to_deg(),
-            deg1(de_text("N")),
-            deg1(de_date(start_date)),
-            deg1(de_date(end_date)),
-        ]
-    } else {
-        // Version 5
-        vec![
-            seg_header("HKKAZ", segment_number, version),
-            deg(vec![
-                de_text(iban),
-                de_empty(),
-                de_text("280"),
-                de_text(bic),
-            ]),
-            deg1(de_text("N")),
-            deg1(de_date(start_date)),
-            deg1(de_date(end_date)),
-        ]
-    };
+) -> Result<Vec<DEG>> {
+    let mut degs = vec![
+        seg_header("HKKAZ", segment_number, version),
+        account.to_deg(version)?,
+        deg1(de_text("N")),
+        deg1(de_date(start_date)),
+        deg1(de_date(end_date)),
+    ];
 
     // Max entries
     degs.push(deg1(de_empty()));
@@ -530,7 +531,7 @@ pub(crate) fn hkkaz(
         degs.push(deg1(de_text(td)));
     }
 
-    degs
+    Ok(degs)
 }
 
 // ---- HKWPD (Wertpapierdepotaufstellung) - Securities Holdings Request, version 1-7 ----
@@ -552,12 +553,12 @@ pub(crate) fn hkwpd(
     bic: &str,
     currency: Option<&str>,
     touchdown: Option<&str>,
-) -> Vec<DEG> {
+) -> Result<Vec<DEG>> {
     let mut degs = if version >= 6 {
         // Version 6+: international account (KTI)
         vec![
             seg_header("HKWPD", segment_number, version),
-            Kti::new(iban, bic).to_deg(),
+            Kti::new(iban, bic)?.to_deg(),
         ]
     } else {
         // Older versions: national account format
@@ -590,7 +591,7 @@ pub(crate) fn hkwpd(
         degs.push(deg1(de_text(td)));
     }
 
-    degs
+    Ok(degs)
 }
 
 #[cfg(test)]
@@ -600,7 +601,7 @@ mod tests {
 
     #[test]
     fn kti_produces_two_data_elements() {
-        let kti = Kti::new("DE04120300001084174299", "BYLADEM1001");
+        let kti = Kti::new("DE04120300001084174299", "BYLADEM1001").unwrap();
         let deg = kti.to_deg();
         // KTI DEG: IBAN:BIC (optional trailing fields omitted)
         assert_eq!(deg.0.len(), 2, "KTI DEG must have exactly 2 data elements");
@@ -610,7 +611,7 @@ mod tests {
 
     #[test]
     fn kti_serializes_as_iban_colon_bic() {
-        let kti = Kti::new("DE04120300001084174299", "BYLADEM1001");
+        let kti = Kti::new("DE04120300001084174299", "BYLADEM1001").unwrap();
         let bytes = serialize_deg(&kti.to_deg()).unwrap();
         let wire = String::from_utf8(bytes).unwrap();
         // Wire format: IBAN:BIC
@@ -619,7 +620,7 @@ mod tests {
 
     #[test]
     fn hksal_v7_wire_format() {
-        let degs = hksal(3, 7, "DE04120300001084174299", "BYLADEM1001", None);
+        let degs = hksal(3, 7, &AccountRef { iban: "DE04120300001084174299", bic: "BYLADEM1001", national: None }, None).unwrap();
         let bytes = serialize_segment(&degs).unwrap();
         let wire = String::from_utf8(bytes).unwrap();
         assert_eq!(wire, "HKSAL:3:7+DE04120300001084174299:BYLADEM1001+N'");
@@ -629,15 +630,8 @@ mod tests {
     fn hkkaz_v7_wire_format() {
         let start = chrono::NaiveDate::from_ymd_opt(2025, 3, 29).unwrap();
         let end = chrono::NaiveDate::from_ymd_opt(2026, 3, 29).unwrap();
-        let degs = hkkaz(
-            3,
-            7,
-            "DE04120300001084174299",
-            "BYLADEM1001",
-            start,
-            end,
-            None,
-        );
+        let acct = AccountRef { iban: "DE04120300001084174299", bic: "BYLADEM1001", national: None };
+        let degs = hkkaz(3, 7, &acct, start, end, None).unwrap();
         let bytes = serialize_segment(&degs).unwrap();
         let wire = String::from_utf8(bytes).unwrap();
         assert_eq!(
@@ -648,7 +642,7 @@ mod tests {
 
     #[test]
     fn hkwpd_v7_wire_format() {
-        let degs = hkwpd(3, 7, "DE04120300001084174299", "BYLADEM1001", None, None);
+        let degs = hkwpd(3, 7, "DE04120300001084174299", "BYLADEM1001", None, None).unwrap();
         let bytes = serialize_segment(&degs).unwrap();
         let wire = String::from_utf8(bytes).unwrap();
         assert_eq!(wire, "HKWPD:3:7+DE04120300001084174299:BYLADEM1001'");
@@ -663,7 +657,8 @@ mod tests {
             "BYLADEM1001",
             Some("EUR"),
             None,
-        );
+        )
+        .unwrap();
         let bytes = serialize_segment(&degs).unwrap();
         let wire = String::from_utf8(bytes).unwrap();
         assert_eq!(wire, "HKWPD:3:7+DE04120300001084174299:BYLADEM1001+EUR'");
@@ -678,7 +673,8 @@ mod tests {
             "BYLADEM1001",
             None,
             Some("TOUCH123"),
-        );
+        )
+        .unwrap();
         let bytes = serialize_segment(&degs).unwrap();
         let wire = String::from_utf8(bytes).unwrap();
         // DEGs: header + KTI + currency(empty) + quality(empty) + max_entries(empty) + touchdown
@@ -689,15 +685,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "IBAN must not be empty")]
-    fn kti_panics_on_empty_iban() {
-        Kti::new("", "BYLADEM1001");
+    fn kti_errors_on_empty_iban() {
+        let e = Kti::new("", "BYLADEM1001").err().expect("error");
+        assert!(e.to_string().contains("IBAN must not be empty"), "{e}");
     }
 
     #[test]
-    #[should_panic(expected = "BIC must not be empty")]
-    fn kti_panics_on_empty_bic() {
-        Kti::new("DE04120300001084174299", "");
+    fn kti_errors_on_empty_bic() {
+        let e = Kti::new("DE04120300001084174299", "").err().expect("error");
+        assert!(e.to_string().contains("BIC must not be empty"), "{e}");
     }
 
     fn wire(degs: &[crate::parser::DEG]) -> String {
@@ -739,5 +735,71 @@ mod tests {
     fn hnvsk_hnshk_profile_is_pin2_for_two_step() {
         assert!(wire(&hnvsk("70020270", "user", "sys", "904")).starts_with("HNVSK:998:3+PIN:2+998+"));
         assert!(wire(&hnshk(2, "904", 4711, "70020270", "user", "sys")).starts_with("HNSHK:2:4+PIN:2+904+4711+"));
+    }
+
+    const HVB_ACCOUNT: AccountRef<'static> = AccountRef {
+        iban: "DE02600202900000123456",
+        bic: "HYVEDEMM",
+        national: Some(("0000123456", "EUR", "60020290")),
+    };
+
+    #[test]
+    fn hksal_v6_uses_national_account_from_hiupd() {
+        assert_eq!(
+            wire(&hksal(3, 6, &HVB_ACCOUNT, None).unwrap()),
+            "HKSAL:3:6+0000123456:EUR:280:60020290+N'"
+        );
+    }
+
+    #[test]
+    fn hkkaz_v6_uses_national_account_without_sub_account() {
+        let acct = AccountRef { national: Some(("0000123456", "", "60020290")), ..HVB_ACCOUNT };
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+        assert_eq!(
+            wire(&hkkaz(3, 6, &acct, start, end, None).unwrap()),
+            "HKKAZ:3:6+0000123456::280:60020290+N+20261017+20261023'"
+        );
+    }
+
+    #[test]
+    fn hksal_v6_without_hiupd_account_is_an_error() {
+        let acct = AccountRef { national: None, ..HVB_ACCOUNT };
+        assert!(hksal(3, 6, &acct, None).is_err());
+    }
+
+    #[test]
+    fn hksal_v7_keeps_iban_and_bic() {
+        assert_eq!(
+            wire(&hksal(3, 7, &HVB_ACCOUNT, None).unwrap()),
+            "HKSAL:3:7+DE02600202900000123456:HYVEDEMM+N'"
+        );
+    }
+
+    /// Replace the volatile parts (timestamp) so the message head can be compared exactly.
+    fn mask_timestamp(wire: &str) -> String {
+        let mut out = String::new();
+        let mut rest = wire;
+        while let Some(i) = rest.find("+1:20") {
+            out.push_str(&rest[..i]);
+            out.push_str("+1:DATE:TIME");
+            let tail = &rest[i + 5..];
+            let end = tail.find(|c| c == '+' || c == '\'').unwrap_or(tail.len());
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn hnvsk_hnshk_two_step_match_recorded_client() {
+        assert_eq!(
+            mask_timestamp(&wire(&hnvsk("70020270", "USER", "SYS", "904"))),
+            "HNVSK:998:3+PIN:2+998+1+1::SYS+1:DATE:TIME+2:2:13:@8@\0\0\0\0\0\0\0\0:5:1+280:70020270:USER:V:0:0+0'"
+        );
+        assert_eq!(
+            mask_timestamp(&wire(&hnshk(2, "904", 807727152, "70020270", "USER", "SYS"))),
+            "HNSHK:2:4+PIN:2+904+807727152+1+1+1::SYS+2+1:DATE:TIME+1:999:1+6:10:16+280:70020270:USER:S:0:0'"
+        );
     }
 }

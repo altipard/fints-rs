@@ -110,9 +110,9 @@ pub(crate) enum Segment {
 
 impl Segment {
     /// Convert to raw DEGs using bank parameters for version selection.
-    pub(crate) fn to_degs(&self, params: &BankParams) -> Vec<DEG> {
+    pub(crate) fn to_degs(&self, params: &BankParams) -> Result<Vec<DEG>> {
         use crate::segments::builder::*;
-        match self {
+        Ok(match self {
             Segment::Identify { blz, user_id, system_id } => {
                 hkidn(0, blz.as_str(), user_id.as_str(), system_id.as_str())
             }
@@ -124,15 +124,17 @@ impl Segment {
             }
             Segment::Balance { account } => {
                 let version = params.supported_version("HISALS", 7).max(5);
-                hksal(0, version, account.iban(), account.bic(), None)
+                let acct = params.account_ref(account, true);
+                hksal(0, version, &acct, None)?
             }
             Segment::Transactions { account, start_date, end_date, touchdown } => {
                 let version = params.supported_version("HIKAZS", 7).max(5);
-                hkkaz(0, version, account.iban(), account.bic(), *start_date, *end_date, touchdown.as_ref().map(|t| t.as_str()))
+                let acct = params.account_ref(account, false);
+                hkkaz(0, version, &acct, *start_date, *end_date, touchdown.as_ref().map(|t| t.as_str()))?
             }
             Segment::Holdings { account, currency, touchdown } => {
                 let version = params.supported_version("HIWPDS", 7).max(1);
-                hkwpd(0, version, account.iban(), account.bic(), currency.as_ref().map(|c| c.as_str()), touchdown.as_ref().map(|t| t.as_str()))
+                hkwpd(0, version, account.iban(), account.bic(), currency.as_ref().map(|c| c.as_str()), touchdown.as_ref().map(|t| t.as_str()))?
             }
             Segment::TanProcess4 { reference_seg, tan_medium } => {
                 let version = params.hktan_version();
@@ -149,7 +151,7 @@ impl Segment {
             Segment::End { dialog_id } => {
                 hkend(0, dialog_id.as_str())
             }
-        }
+        })
     }
 }
 
@@ -256,6 +258,10 @@ impl Response {
     pub fn get_tan_challenge(&self) -> Option<TanChallenge> {
         if let Some(hitan) = self.find_segment("HITAN") {
             let (task_ref, challenge, hhduc) = parse_hitan(hitan);
+            // "noref"/"nochallenge" is the bank's filler when no TAN is needed (SCA exemption).
+            if task_ref == "noref" {
+                return None;
+            }
             if !task_ref.is_empty() || !challenge.is_empty() {
                 return Some(TanChallenge {
                     challenge: ChallengeText::new(challenge),
@@ -384,6 +390,17 @@ impl BankParams {
                 .filter(|s| s.segment_type() == "HITANS")
                 .map(|s| s.segment_version()),
         );
+        // A response with BPD/UPD (HKVVB 0/0) is complete: replace, don't pile up.
+        if response.find_segment("HIBPA").is_some() {
+            self.bpd_segments.clear();
+        }
+        if response.find_segment("HIUPA").is_some() {
+            self.upd_segments.clear();
+            self.accounts_from_upd.clear();
+        }
+        if hitans_version.is_some() {
+            self.tan_methods.clear();
+        }
         for seg in &response.segments {
             let stype = seg.segment_type();
             match stype {
@@ -425,6 +442,20 @@ impl BankParams {
         if !allowed.is_empty() {
             self.allowed_security_functions = allowed;
         }
+    }
+
+    /// Account as HKSAL/HKKAZ address it: IBAN/BIC plus the national account
+    /// number and BLZ from HIUPD (the IBAN is not parsed for them).
+    /// `with_sub_account`: send the sub-account feature of HIUPD (HKSAL) or leave it empty (HKKAZ).
+    pub(crate) fn account_ref<'a>(&'a self, account: &'a Account, with_sub_account: bool) -> crate::segments::builder::AccountRef<'a> {
+        let national = self.accounts_from_upd.iter()
+            .find(|a| a.iban.as_str() == account.iban())
+            .map(|a| (
+                a.account_number.as_str(),
+                if with_sub_account { a.sub_account.as_str() } else { "" },
+                a.blz.as_str(),
+            ));
+        crate::segments::builder::AccountRef { iban: account.iban(), bic: account.bic(), national }
     }
 
     /// Does the given operation require TAN (per HIPINS)? Default: true (safe).
@@ -558,6 +589,16 @@ impl<S: std::fmt::Debug> Dialog<S> {
         Segment::ProcessPrep {
             bpd_version: self.params.bpd_version,
             upd_version: self.params.upd_version,
+            product_id: self.product_id.clone(),
+        }
+    }
+
+    /// HKVVB asking for BPD and UPD afresh (version 0/0), as banks like the HVB
+    /// expect from a normal init; cached versions get answered with 1040 "BPD outdated".
+    fn fresh_process_prep_segment(&self) -> Segment {
+        Segment::ProcessPrep {
+            bpd_version: 0,
+            upd_version: 0,
             product_id: self.product_id.clone(),
         }
     }
@@ -704,7 +745,7 @@ impl Dialog<New> {
 
         let segments = [
             self.identify_segment(),
-            self.process_prep_segment(),
+            self.fresh_process_prep_segment(),
             Segment::TanProcess4 { reference_seg: SegmentRef::new("HKIDN"), tan_medium: medium },
         ];
 
@@ -731,8 +772,8 @@ impl Dialog<New> {
             return Ok(InitResult::Opened(open, response));
         }
 
-        // Response-driven transition per spec:
-        if response.needs_tan() {
+        // Response-driven transition per spec (3076: no strong authentication needed):
+        if response.needs_tan() && !response.has_sca_exemption() {
             if let Some(challenge) = response.get_tan_challenge() {
                 // 0030/3955: TAN required on init → TanPending
                 let challenge = TanChallenge {
@@ -755,7 +796,7 @@ impl Dialog<New> {
         info!("[FinTS] Init (no HKTAN)");
         let segments = [
             self.identify_segment(),
-            self.process_prep_segment(),
+            self.fresh_process_prep_segment(),
         ];
 
         let response = self.send_segments(&segments).await?;
@@ -1277,5 +1318,17 @@ mod tests {
         assert_eq!(ch.task_reference.as_str(), "REF-4711");
         assert_eq!(ch.challenge.as_str(), "Freigabe durch appTAN");
         assert!(!ch.decoupled);
+    }
+
+    #[test]
+    fn sca_exemption_with_noref_hitan_is_no_challenge() {
+        let r = response(
+            "HIRMG:2:2+0020::ok+3076::Keine starke Authentifizierung erforderlich'\
+             HITAN:5:6:5+4++noref+nochallenge'",
+        );
+        assert!(r.has_sca_exemption());
+        assert!(!r.needs_tan());
+        assert!(r.get_tan_challenge().is_none());
+        assert!(r.check_errors().is_ok());
     }
 }

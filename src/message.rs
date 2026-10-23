@@ -44,7 +44,7 @@ pub(crate) fn build_from_segments(
     params: &BankParams,
 ) -> Result<Vec<u8>, FinTSError> {
     // Convert typed segments to raw DEGs
-    let business_degs: Vec<Vec<DEG>> = segments.iter().map(|s| s.to_degs(params)).collect();
+    let business_degs: Vec<Vec<DEG>> = segments.iter().map(|s| s.to_degs(params)).collect::<Result<_, FinTSError>>()?;
     build_message_raw(ctx, business_degs)
 }
 

@@ -1048,4 +1048,30 @@ mod tests {
         assert_eq!(params.selected_security_function, SecurityFunction::new("904"));
         assert_eq!(params.hktan_version(), 6);
     }
+
+    // ── HIUPD / HISAL (HVB, recorded) ─────────────────────────────────
+
+    #[test]
+    fn test_parse_hiupd_hvb_account() {
+        let seg = parse_segment(
+            "HIUPD:107:6:4+0000123456:EUR:280:60020290+DE02600202900000123456+USER+2+EUR+Max Mustermann++Kontokorrentkonto++HKSAL:1+HKKAZ:1'",
+        );
+        let acc = parse_hiupd(&seg).expect("account");
+        assert_eq!(acc.account_number, "0000123456");
+        assert_eq!(acc.sub_account, "EUR");
+        assert_eq!(acc.blz.as_str(), "60020290");
+        assert_eq!(acc.iban.as_str(), "DE02600202900000123456");
+        assert_eq!(acc.owner.as_deref(), Some("Max Mustermann"));
+        assert_eq!(acc.product_name.as_deref(), Some("Kontokorrentkonto"));
+        assert_eq!(acc.currency.as_ref().map(|c| c.as_str()), Some("EUR"));
+    }
+
+    #[test]
+    fn test_parse_hisal_v6_hvb() {
+        let seg = parse_segment(
+            "HISAL:4:6:3+0000123456:EUR:280:60020290+Kontokorrentkonto+EUR+C:962,14:EUR:20261023:200300+C:0,:EUR:20261023:200300+0,:EUR+962,14:EUR+0,:EUR'",
+        );
+        let bal = parse_hisal(&seg).expect("balance");
+        assert_eq!(bal.amount.to_string(), "962.14");
+    }
 }
