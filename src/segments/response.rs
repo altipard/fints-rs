@@ -39,61 +39,80 @@ fn looks_like_bic(s: &str) -> bool {
         && bytes[6..].iter().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// Parse TAN methods from HITANS response segment(s).
-/// HITANS contains TwoStepParameters (one per supported TAN method) in its DEGs.
+/// Fields per two-step procedure block, by HITANS version.
+/// Blocks follow each other inside ONE DEG ("Parameter Zwei-Schritt-TAN-Einreichung").
+fn hitans_block_len(version: u16) -> Option<usize> {
+    match version {
+        1 | 2 | 3 => Some(11),
+        4 | 5 => Some(22),
+        6 => Some(21),
+        7 => Some(26),
+        _ => None,
+    }
+}
+
+/// Which HITANS version of a response to use: highest of 6..=7, else 5, else 4.
+pub(crate) fn pick_hitans_version(versions: impl Iterator<Item = u16>) -> Option<u16> {
+    let versions: Vec<u16> = versions.collect();
+    [7u16, 6, 5, 4].into_iter().find(|v| versions.contains(v))
+}
+
+/// Parse TAN methods from one HITANS segment.
+///
+/// Layout: header, max jobs, min signatures, security class, then a single DEG
+/// holding the parameters: one-step allowed, multiple jobs, hash mode (v1: plus
+/// bank-signature profile), followed by the procedure blocks back to back.
 pub(crate) fn parse_hitans(seg: &RawSegment) -> Vec<TanMethod> {
     let version = seg.segment_version();
     let mut methods = Vec::new();
+    let Some(block_len) = hitans_block_len(version) else {
+        return methods;
+    };
+    let prefix = if version == 1 { 4 } else { 3 };
+    let deg = seg.deg(4);
+    let elems: Vec<String> = (0..deg.len()).map(|i| deg.get_str(i)).collect();
+    let Some(body) = elems.get(prefix..) else {
+        return methods;
+    };
+    let name_idx = if version >= 4 { 5 } else { 3 };
 
-    // HITANS structure varies by version but the TAN parameters start at DEG 4+
-    // DEG 1 = header, DEG 2 = max one-step jobs, DEG 3 = security class,
-    // DEG 4+ = two-step parameters (one DEG per method)
-    for i in 4..seg.deg_count() {
-        let d = seg.deg(i);
-        if d.len() < 3 {
-            continue;
+    for block in body.chunks(block_len) {
+        let field = |i: usize| block.get(i).map(String::as_str).unwrap_or("");
+        let security_function = field(0);
+        let tan_process = field(1);
+        // A ragged tail (or a bank deviating from the spec) ends parsing.
+        if block.len() < block_len
+            || security_function.len() != 3
+            || !security_function.bytes().all(|b| b.is_ascii_digit())
+            || !matches!(tan_process, "1" | "2" | "S")
+        {
+            break;
         }
 
-        let security_function = d.get_str(0);
-        if security_function.is_empty() {
-            continue;
-        }
+        let name = field(name_idx);
+        let needs_tan_medium = version >= 6 && matches!(field(18), "1" | "2");
 
-        let tan_process = d.get_str(1);
-        // Name is at different positions depending on version
-        let name = if version >= 6 {
-            d.get_str(3) // Index 3 for v6/v7
-        } else {
-            d.get_str(2) // Index 2 for older versions
-        };
-
-        let needs_tan_medium = if version >= 6 && d.len() > 13 {
-            let val = d.get_str(13);
-            val == "2" || val == "1" // 2 = required, 1 = allowed
-        } else {
-            false
-        };
-
-        // Decoupled parameters (v7 only, high indices)
-        let (is_decoupled, max_polls, wait_first, wait_next) = if version >= 7 && d.len() > 24 {
-            let decoupled = d.get_str(21) == "J";
-            let max_p = d.get_str(22).parse::<i32>().unwrap_or(-1);
-            let wf = d.get_str(23).parse::<i32>().unwrap_or(0);
-            let wn = d.get_str(24).parse::<i32>().unwrap_or(0);
-            (decoupled, max_p, wf, wn)
+        let (is_decoupled, max_polls, wait_first, wait_next) = if version >= 7 {
+            let decoupled = tan_process == "S" || !field(21).is_empty();
+            (
+                decoupled,
+                field(21).parse::<i32>().unwrap_or(-1),
+                field(22).parse::<i32>().unwrap_or(0),
+                field(23).parse::<i32>().unwrap_or(0),
+            )
         } else {
             (false, -1, 0, 0)
         };
 
         let display_name = if name.is_empty() {
-            format!("TAN-{}", &security_function)
+            format!("TAN-{}", security_function)
         } else {
-            name
+            name.to_string()
         };
 
         methods.push(TanMethod {
             security_function: SecurityFunction::new(security_function),
-            tan_process: TanProcess::from_str_val(&tan_process),
+            tan_process: TanProcess::from_str_val(tan_process),
             name: display_name,
             needs_tan_medium,
             decoupled_max_polls: max_polls,
@@ -966,5 +985,67 @@ mod tests {
 
         assert_eq!(find_highest_segment_version(&segments, "HIWPDS", 7), 6);
         assert_eq!(find_highest_segment_version(&segments, "HIWPDS", 5), 1);
+    }
+
+    // ── HITANS (HypoVereinsbank, BLZ 70020270) ────────────────────────
+
+    const HVB_HITANS: [&str; 4] = [
+        "HITANS:52:1:4+1+1+1+N:N:1:0:900:1:01:iTAN-Verfahren(indizierte TAN):6:1:indizierte TAN:256:1:N:N:903:2:03:mobileTAN-Verfahren:6:1:Freigabe durch mobileTAN:1::N:N:904:2:04:appTAN-Verfahren:6:1:Freigabe durch appTAN:1::N:N:905:2:MS1.0.0:photoTAN-Verfahren:6:1:Freigabe durch photoTAN:1::N:N'",
+        "HITANS:53:4:4+1+1+1+N:N:1:900:1:01:::iTAN-Verfahren(indizierte TAN):6:1:indizierte TAN:256:1:N:4:0:N:N:N:N:N:00:0::903:2:03:::mobileTAN-Verfahren:6:1:Freigabe durch mobileTAN:1::N:1:0:N:N:N:N:N:00:0::904:2:04:::appTAN-Verfahren:6:1:Freigabe durch appTAN:1::N:1:0:N:N:N:N:N:00:0::905:2:MS1.0.0:::photoTAN-Verfahren:6:1:Freigabe durch photoTAN:1::N:1:0:N:N:N:N:N:00:0:'",
+        "HITANS:54:5:4+1+1+1+N:N:1:900:1:01:::iTAN-Verfahren(indizierte TAN):6:1:indizierte TAN:256:1:N:4:0:N:0:0:N:N:00:0::903:2:03:::mobileTAN-Verfahren:6:1:Freigabe durch mobileTAN:1::N:1:0:N:0:0:N:N:00:0::904:2:04:::appTAN-Verfahren:6:1:Freigabe durch appTAN:1::N:1:0:N:0:0:N:N:00:0::905:2:MS1.0.0:::photoTAN-Verfahren:6:1:Freigabe durch photoTAN:1::N:1:0:N:0:0:N:N:00:0:'",
+        "HITANS:55:6:4+1+1+1+N:N:1:900:1:01:::iTAN-Verfahren(indizierte TAN):6:1:indizierte TAN:256:N:4:N:0:0:N:N:00:0:N::903:2:03:::mobileTAN-Verfahren:6:1:Freigabe durch mobileTAN:1:N:1:N:0:0:N:N:00:0:N::904:2:04:::appTAN-Verfahren:6:1:Freigabe durch appTAN:1:N:1:N:0:0:N:N:00:0:N::905:2:MS1.0.0:::photoTAN-Verfahren:6:1:Freigabe durch photoTAN:1:N:1:N:0:0:N:N:00:0:N:'",
+    ];
+
+    /// Parse the HVB segments the way ingest_response does (highest of v6/v7 only).
+    fn hvb_methods() -> Vec<TanMethod> {
+        let segs: Vec<RawSegment> = HVB_HITANS.iter().map(|s| parse_segment(s)).collect();
+        let version = pick_hitans_version(segs.iter().map(|s| s.segment_version()));
+        assert_eq!(version, Some(6));
+        segs.iter()
+            .filter(|s| Some(s.segment_version()) == version)
+            .flat_map(parse_hitans)
+            .collect()
+    }
+
+    #[test]
+    fn test_hitans_hvb_four_methods() {
+        let methods = hvb_methods();
+        let sfs: Vec<&str> = methods.iter().map(|m| m.security_function.as_str()).collect();
+        assert_eq!(sfs, ["900", "903", "904", "905"]);
+
+        let app = &methods[2];
+        assert_eq!(app.tan_process, TanProcess::TwoStep);
+        assert_eq!(app.name, "appTAN-Verfahren");
+        assert!(!app.needs_tan_medium);
+        assert!(!app.is_decoupled);
+        assert_eq!(app.hktan_version, 6);
+        assert_eq!(methods[0].tan_process, TanProcess::OneStep);
+        assert_eq!(methods[0].name, "iTAN-Verfahren(indizierte TAN)");
+    }
+
+    #[test]
+    fn test_hitans_hvb_every_version_parses_without_garbage() {
+        for raw in HVB_HITANS {
+            let methods = parse_hitans(&parse_segment(raw));
+            let sfs: Vec<&str> = methods.iter().map(|m| m.security_function.as_str()).collect();
+            assert_eq!(sfs, ["900", "903", "904", "905"], "{raw}");
+        }
+    }
+
+    #[test]
+    fn test_hitans_garbage_does_not_panic() {
+        for raw in ["HITANS:1:6:4'", "HITANS:1:6:4+1+1+1'", "HITANS:1:6:4+1+1+1+N:N:1:9'", "HITANS:1:9:4+1+1+1+N:N:1:904:2'"] {
+            assert!(parse_hitans(&parse_segment(raw)).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn test_hktan_version_hvb_is_6() {
+        let mut params = crate::protocol::BankParams::new();
+        params.tan_methods = hvb_methods();
+        params.allowed_security_functions = vec![SecurityFunction::new("904")];
+        params.select_security_function();
+        assert_eq!(params.selected_security_function, SecurityFunction::new("904"));
+        assert_eq!(params.hktan_version(), 6);
     }
 }

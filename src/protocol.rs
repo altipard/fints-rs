@@ -338,11 +338,22 @@ impl BankParams {
 
     /// Ingest BPD/UPD/HITANS/HIPINS/HISYN from a response.
     pub fn ingest_response(&mut self, response: &Response, system_id: &mut SystemId) {
+        // The bank sends one HITANS per version; mixing versions would yield
+        // duplicates and an HKTAN version the bank did not offer for the method.
+        let hitans_version = pick_hitans_version(
+            response.segments.iter()
+                .filter(|s| s.segment_type() == "HITANS")
+                .map(|s| s.segment_version()),
+        );
         for seg in &response.segments {
             let stype = seg.segment_type();
             match stype {
                 "HIBPA" => self.bpd_version = parse_hibpa_version(seg),
-                "HITANS" => self.tan_methods.extend(parse_hitans(seg)),
+                "HITANS" => {
+                    if Some(seg.segment_version()) == hitans_version {
+                        self.tan_methods.extend(parse_hitans(seg));
+                    }
+                }
                 "HIPINS" => {
                     let m = parse_hipins(seg);
                     if !m.is_empty() {
@@ -387,6 +398,7 @@ impl BankParams {
         self.tan_methods.iter()
             .find(|m| m.security_function == self.selected_security_function)
             .map(|m| m.hktan_version)
+            .or_else(|| self.tan_methods.iter().map(|m| m.hktan_version).max())
             .unwrap_or(7)
     }
 
